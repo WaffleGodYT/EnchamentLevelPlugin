@@ -8,16 +8,22 @@ import org.bukkit.Color;
 import org.bukkit.GameMode;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Location;
 import org.bukkit.Particle;
 import org.bukkit.Registry;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.attribute.AttributeInstance;
+import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabExecutor;
 import org.bukkit.enchantments.Enchantment;
+import org.bukkit.entity.Item;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
+import org.bukkit.entity.TNTPrimed;
 import org.bukkit.event.Event;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -29,26 +35,34 @@ import org.bukkit.event.enchantment.EnchantItemEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
+import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.PrepareGrindstoneEvent;
 import org.bukkit.event.player.PlayerExpChangeEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerItemDamageEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerRespawnEvent;
+import org.bukkit.event.player.PlayerToggleFlightEvent;
 import org.bukkit.inventory.AnvilInventory;
+import org.bukkit.inventory.EntityEquipment;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.ShapelessRecipe;
+import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.inventory.meta.PotionMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
+import org.bukkit.util.RayTraceResult;
 
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -64,7 +78,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
 
     private static final int ANVIL_RESULT_SLOT = 2;
 
-    // The 10 special enchants. They never go above level II.
+    // The 17 special enchants. They never go above level II.
     private enum Special {
         LIFESTEAL("Lifesteal", "Critical hits give you Regeneration (3s / 5s)", "_SWORD", "_AXE"),
         FROSTBITE("Frostbite", "Hits can chill and slow the target (25% / 40%)", "_SWORD", "_AXE"),
@@ -75,7 +89,14 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         NIGHTSIGHT("Nightsight", "Night Vision in dark places", "_HELMET"),
         SPRINGHEEL("Springheel", "Jump Boost I / II", "_BOOTS"),
         PROSPECTOR("Prospector", "Ores can drop extra (12% / 24%)", "_PICKAXE"),
-        SNARE("Snare", "Arrows slow the target (Slowness I / II)", "BOW");
+        SNARE("Snare", "Arrows slow the target (Slowness I / II)", "BOW"),
+        CLEAVE("Cleave", "Your hits wear down the target's armor faster (2x / 3x durability loss)", "_AXE"),
+        ORBITAL("Orbital", "Sneak + right-click: 6 TNT fall from the sky where you look (45s / 30s cooldown)", "FISHING_ROD"),
+        POGO("Pogo", "Double jump in mid-air (I / II = higher)", "_BOOTS"),
+        ASCENSION("Ascension", "Hitting a player weakens and slows them, and gives you Fire Resistance and Speed (3s / 5s)", "MACE"),
+        MUTILATION("Mutilation", "Much faster attacks (2x / 2.5x speed), but the sword wears out 4x faster", "_SWORD"),
+        STORMCALLER("Stormcaller", "Trident hits can call lightning (15% / 25%, +3 / +5 damage)", "TRIDENT"),
+        GROUNDBREAKER("Groundbreaker", "Haste while holding a shovel (I / II)", "_SHOVEL");
 
         final String display;
         final String description;
@@ -107,6 +128,11 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
     private final Map<Special, NamespacedKey> specialKeys = new EnumMap<>(Special.class);
     private final Set<UUID> pendingLoss = new HashSet<>();
     private final Map<UUID, Long> secondWindReady = new HashMap<>();
+    private final Map<UUID, Long> orbitalReady = new HashMap<>();
+    private final Set<UUID> pogoFlyers = new HashSet<>();
+    private NamespacedKey orbitalKey;
+    private NamespacedKey mutilationKey;
+    private boolean orbitalBreakBlocks;
 
     private int startLevel;
     private int minLevel;
@@ -137,6 +163,8 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         bottleKey = new NamespacedKey(this, "level_bottle");
         potionKey = new NamespacedKey(this, "level_potion");
         recipeKey = new NamespacedKey(this, "potion_of_levels");
+        orbitalKey = new NamespacedKey(this, "orbital_tnt");
+        mutilationKey = new NamespacedKey(this, "mutilation_speed");
         for (Special special : Special.values()) {
             specialKeys.put(special, new NamespacedKey(this, "se_" + special.id()));
         }
@@ -149,7 +177,16 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
             for (Player player : getServer().getOnlinePlayers()) checkArmor(player);
         }, 20L, 4L);
 
-        // Passive special enchants (Nightsight, Springheel) refresh once a second.
+        // Pogo (double jump) and Mutilation (attack speed) are checked 10 times a second.
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            if (!specialEnchants) return;
+            for (Player player : getServer().getOnlinePlayers()) {
+                updatePogo(player);
+                updateMutilation(player);
+            }
+        }, 40L, 2L);
+
+        // Passive special enchants (Nightsight, Springheel, Groundbreaker) refresh once a second.
         getServer().getScheduler().runTaskTimer(this, () -> {
             if (!specialEnchants) return;
             for (Player player : getServer().getOnlinePlayers()) passiveEffects(player);
@@ -184,6 +221,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         specialTwoMinLevel = getConfig().getInt("special-level-2-min-level", 25);
         anyEnchant = getConfig().getBoolean("any-enchant", true);
         anyEnchantLevel = getConfig().getInt("any-enchant-level", 30);
+        orbitalBreakBlocks = getConfig().getBoolean("orbital-break-blocks", false);
         anyEnchantChance = chance("any-enchant-chance", 0.50);
     }
 
@@ -261,12 +299,41 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
     }
 
     // Put the special enchant on the item (max level II) and show it in the lore.
+    // An item only ever has ONE special enchant: adding one replaces any other.
     private void addSpecial(ItemStack item, Special special, int level) {
         ItemMeta meta = item.getItemMeta();
+        for (Special other : Special.values()) {
+            meta.getPersistentDataContainer().remove(specialKeys.get(other));
+        }
         int clamped = Math.max(1, Math.min(2, level));
         meta.getPersistentDataContainer().set(specialKeys.get(special), PersistentDataType.INTEGER, clamped);
         refreshLore(meta);
         item.setItemMeta(meta);
+    }
+
+    private boolean hasAnySpecial(ItemStack item) {
+        for (Special special : Special.values()) {
+            if (specialLevel(item, special) > 0) return true;
+        }
+        return false;
+    }
+
+    // Take every special enchant off the item (used by the grindstone).
+    private void stripSpecials(ItemStack item) {
+        ItemMeta meta = item.getItemMeta();
+        for (Special special : Special.values()) {
+            meta.getPersistentDataContainer().remove(specialKeys.get(special));
+        }
+        refreshLore(meta);
+        item.setItemMeta(meta);
+    }
+
+    // The one real item in the grindstone's two slots, or null if there are zero or two.
+    private ItemStack soleItem(ItemStack upper, ItemStack lower) {
+        boolean hasUpper = upper != null && !upper.getType().isAir();
+        boolean hasLower = lower != null && !lower.getType().isAir();
+        if (hasUpper == hasLower) return null;
+        return hasUpper ? upper : lower;
     }
 
     // Special enchant lines go at the top of the lore; other lore is left alone.
@@ -357,6 +424,24 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
             target.setFreezeTicks(Math.max(target.getFreezeTicks(), 100));
         }
 
+        int cleave = specialLevel(weapon, Special.CLEAVE);
+        if (cleave > 0) shredArmor(target, cleave, event.getFinalDamage());
+
+        int ascension = specialLevel(weapon, Special.ASCENSION);
+        if (ascension > 0 && target instanceof Player) {
+            int ticks = ascension == 1 ? 60 : 100;
+            target.addPotionEffect(new PotionEffect(PotionEffectType.WEAKNESS, ticks, 0));
+            target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, ticks, 0));
+            player.addPotionEffect(new PotionEffect(PotionEffectType.FIRE_RESISTANCE, ticks, 0));
+            player.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, ticks, 0));
+        }
+
+        int storm = specialLevel(weapon, Special.STORMCALLER);
+        if (storm > 0 && rng.nextDouble() < (storm == 1 ? 0.15 : 0.25)) {
+            target.getWorld().strikeLightningEffect(target.getLocation());
+            event.setDamage(event.getDamage() + (storm == 1 ? 3.0 : 5.0));
+        }
+
         int executioner = specialLevel(weapon, Special.EXECUTIONER);
         if (executioner > 0 && target.getHealth() <= target.getMaxHealth() * 0.35) {
             event.setDamage(event.getDamage() + (executioner == 1 ? 1.5 : 3.0));
@@ -425,9 +510,153 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
             player.addPotionEffect(new PotionEffect(PotionEffectType.NIGHT_VISION, 300, 0, false, false, true));
         }
 
+        int dig = specialLevel(inv.getItemInMainHand(), Special.GROUNDBREAKER);
+        if (dig > 0) {
+            player.addPotionEffect(new PotionEffect(PotionEffectType.HASTE, 60, dig - 1, false, false, true));
+        }
+
         int spring = specialLevel(inv.getBoots(), Special.SPRINGHEEL);
         if (spring > 0) {
             player.addPotionEffect(new PotionEffect(PotionEffectType.JUMP_BOOST, 60, spring - 1, false, false, true));
+        }
+    }
+
+    // Cleave: extra durability loss on the target's armor (vanilla loss x2 at I, x3 at II).
+    private void shredArmor(LivingEntity target, int level, double damage) {
+        EntityEquipment equipment = target.getEquipment();
+        if (equipment == null) return;
+        int extra = Math.max(1, (int) (damage / 4.0)) * level;
+        ItemStack[] armor = equipment.getArmorContents();
+        boolean changed = false;
+        for (int i = 0; i < armor.length; i++) {
+            ItemStack piece = armor[i];
+            if (piece == null || piece.getType().isAir()) continue;
+            ItemMeta meta = piece.getItemMeta();
+            if (!(meta instanceof Damageable damageable) || meta.isUnbreakable()) continue;
+            int worn = damageable.getDamage() + extra;
+            if (worn >= piece.getType().getMaxDurability()) {
+                armor[i] = null;
+            } else {
+                damageable.setDamage(worn);
+                piece.setItemMeta(meta);
+            }
+            changed = true;
+        }
+        if (changed) equipment.setArmorContents(armor);
+    }
+
+    // Mutilation: swords wear out 4x faster.
+    @EventHandler(ignoreCancelled = true)
+    public void onMutilationWear(PlayerItemDamageEvent event) {
+        if (!specialEnchants) return;
+        if (specialLevel(event.getItem(), Special.MUTILATION) == 0) return;
+        event.setDamage(event.getDamage() * 4);
+    }
+
+    // Mutilation: faster attacks while the sword is in your main hand (+100% / +150% attack speed).
+    private void updateMutilation(Player player) {
+        AttributeInstance speed = player.getAttribute(Attribute.ATTACK_SPEED);
+        if (speed == null) return;
+        AttributeModifier current = null;
+        for (AttributeModifier modifier : speed.getModifiers()) {
+            if (mutilationKey.equals(modifier.getKey())) {
+                current = modifier;
+                break;
+            }
+        }
+        int level = specialLevel(player.getInventory().getItemInMainHand(), Special.MUTILATION);
+        double wanted = level == 0 ? 0.0 : (level == 1 ? 1.0 : 1.5);
+        if (level != 0 && current != null && current.getAmount() == wanted) return;
+        if (current != null) speed.removeModifier(current);
+        if (level != 0) {
+            speed.addTransientModifier(new AttributeModifier(mutilationKey, wanted, AttributeModifier.Operation.ADD_SCALAR));
+        }
+    }
+
+    // Pogo: flight is only switched on while standing on the ground, so the "flight toggle"
+    // (double-tap jump) in mid-air becomes a double jump.
+    private void updatePogo(Player player) {
+        GameMode mode = player.getGameMode();
+        boolean normal = mode == GameMode.SURVIVAL || mode == GameMode.ADVENTURE;
+        UUID id = player.getUniqueId();
+        int pogo = specialLevel(player.getInventory().getBoots(), Special.POGO);
+        if (pogo > 0 && normal) {
+            pogoFlyers.add(id);
+            if (player.isOnGround() && !player.getAllowFlight()) player.setAllowFlight(true);
+        } else if (pogoFlyers.remove(id) && normal) {
+            player.setFlying(false);
+            player.setAllowFlight(false);
+        }
+    }
+
+    @EventHandler(ignoreCancelled = true)
+    public void onPogoJump(PlayerToggleFlightEvent event) {
+        Player player = event.getPlayer();
+        if (!specialEnchants || !event.isFlying() || !pogoFlyers.contains(player.getUniqueId())) return;
+        GameMode mode = player.getGameMode();
+        if (mode != GameMode.SURVIVAL && mode != GameMode.ADVENTURE) return;
+        int pogo = specialLevel(player.getInventory().getBoots(), Special.POGO);
+        if (pogo == 0) return;
+        event.setCancelled(true);
+        player.setFlying(false);
+        player.setAllowFlight(false);
+        player.setVelocity(player.getVelocity().setY(pogo == 1 ? 0.75 : 0.95));
+        player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation(), 8, 0.3, 0.05, 0.3, 0.02);
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent event) {
+        Player player = event.getPlayer();
+        if (pogoFlyers.remove(player.getUniqueId())) {
+            player.setAllowFlight(false);
+        }
+    }
+
+    // Orbital: sneak + right-click with an Orbital fishing rod to call 6 TNT down from the sky.
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onOrbital(PlayerInteractEvent event) {
+        if (!specialEnchants) return;
+        if (event.getAction() != Action.RIGHT_CLICK_AIR && event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        if (event.getHand() != EquipmentSlot.HAND) return;
+        Player player = event.getPlayer();
+        if (!player.isSneaking()) return;
+        ItemStack rod = event.getItem();
+        int orbital = specialLevel(rod, Special.ORBITAL);
+        if (orbital == 0 || !canUse(player, rod)) return;
+        event.setUseItemInHand(Event.Result.DENY);
+
+        long now = System.currentTimeMillis();
+        long ready = orbitalReady.getOrDefault(player.getUniqueId(), 0L);
+        if (ready > now) {
+            tell(player, "Orbital recharging: " + ((ready - now + 999) / 1000) + "s", NamedTextColor.RED);
+            return;
+        }
+        orbitalReady.put(player.getUniqueId(), now + (orbital == 1 ? 45_000L : 30_000L));
+
+        RayTraceResult hit = player.rayTraceBlocks(40.0);
+        Location aim = hit != null
+                ? hit.getHitPosition().toLocation(player.getWorld())
+                : player.getEyeLocation().add(player.getEyeLocation().getDirection().multiply(40));
+        int height = 0;
+        while (height < 14 && aim.clone().add(0, height + 1, 0).getBlock().isPassable()) height++;
+        ThreadLocalRandom rng = ThreadLocalRandom.current();
+        for (int i = 0; i < 6; i++) {
+            Location spot = aim.clone().add(rng.nextDouble(-2.5, 2.5), height, rng.nextDouble(-2.5, 2.5));
+            player.getWorld().spawn(spot, TNTPrimed.class, tnt -> {
+                tnt.setFuseTicks(70);
+                tnt.setSource(player);
+                tnt.getPersistentDataContainer().set(orbitalKey, PersistentDataType.BYTE, (byte) 1);
+            });
+        }
+        tell(player, "Orbital strike incoming!", NamedTextColor.LIGHT_PURPLE);
+    }
+
+    // Orbital TNT doesn't break blocks unless orbital-break-blocks is on (it still hurts).
+    @EventHandler(ignoreCancelled = true)
+    public void onOrbitalBlast(EntityExplodeEvent event) {
+        if (orbitalBreakBlocks) return;
+        if (event.getEntity().getPersistentDataContainer().has(orbitalKey, PersistentDataType.BYTE)) {
+            event.blockList().clear();
         }
     }
 
@@ -555,7 +784,8 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
 
         if (victim.getLevel() > minLevel) {
             pendingLoss.add(victim.getUniqueId());
-            victim.getWorld().dropItemNaturally(victim.getLocation(), levelBottle());
+            Item bottle = victim.getWorld().dropItemNaturally(victim.getLocation(), levelBottle());
+            bottle.setInvulnerable(true);
         }
 
         Player killer = victim.getKiller();
@@ -602,6 +832,30 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         tell(player, "+" + gained + (gained == 1 ? " level (" : " levels (") + player.getLevel() + ")", NamedTextColor.GREEN);
     }
 
+    // Bottles and potions of levels don't burn in lava or fire, and can't be blown up.
+    @EventHandler
+    public void onLevelItemDamage(EntityDamageEvent event) {
+        if (!(event.getEntity() instanceof Item dropped)) return;
+        if (levelsIn(dropped.getItemStack()) == 0) return;
+        switch (event.getCause()) {
+            case FIRE, FIRE_TICK, LAVA, HOT_FLOOR, CONTACT, BLOCK_EXPLOSION, ENTITY_EXPLOSION -> event.setCancelled(true);
+            default -> { }
+        }
+    }
+
+    // Grindstone: special enchants come off like normal ones.
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onGrindstone(PrepareGrindstoneEvent event) {
+        ItemStack source = event.getResult();
+        if (source == null || source.getType().isAir()) {
+            source = soleItem(event.getInventory().getUpperItem(), event.getInventory().getLowerItem());
+        }
+        if (source == null || !hasAnySpecial(source)) return;
+        ItemStack cleaned = source.clone();
+        stripSpecials(cleaned);
+        event.setResult(cleaned);
+    }
+
     // Dispensers can't throw or use these items.
     @EventHandler(ignoreCancelled = true)
     public void onDispense(BlockDispenseEvent event) {
@@ -634,6 +888,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         Inventory top = player.getOpenInventory().getTopInventory();
         ItemStack enchanted = top.getItem(0);
         if (enchanted == null || !special.fits(enchanted.getType())) return;
+        if (hasAnySpecial(enchanted)) return;
         addSpecial(enchanted, special, specialLevel);
         top.setItem(0, enchanted);
         tell(player, "Special enchant: " + special.display + " " + roman(specialLevel), NamedTextColor.LIGHT_PURPLE);
