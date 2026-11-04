@@ -41,6 +41,7 @@ import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.PrepareGrindstoneEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerExpChangeEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerItemDamageEvent;
@@ -130,6 +131,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
     private final Map<UUID, Long> secondWindReady = new HashMap<>();
     private final Map<UUID, Long> orbitalReady = new HashMap<>();
     private final Set<UUID> pogoFlyers = new HashSet<>();
+    private final Map<UUID, Long> dupeCooldown = new HashMap<>();
     private NamespacedKey orbitalKey;
     private NamespacedKey mutilationKey;
     private boolean orbitalBreakBlocks;
@@ -196,6 +198,11 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
     @Override
     public void onDisable() {
         if (recipeKey != null) getServer().removeRecipe(recipeKey);
+    }
+
+    // Secret glitches can each be switched off in config.yml under "glitches:" (default: on).
+    private boolean glitch(String name) {
+        return getConfig().getBoolean("glitches." + name, true);
     }
 
     private double chance(String path, double fallback) {
@@ -601,6 +608,15 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         player.setFlying(false);
         player.setAllowFlight(false);
         player.setVelocity(player.getVelocity().setY(pogo == 1 ? 0.75 : 0.95));
+        // Secret glitch: double jump while sprinting and you dash forward.
+        if (glitch("sprint-pogo") && player.isSprinting()) {
+            var dash = player.getLocation().getDirection().setY(0);
+            if (dash.lengthSquared() > 0.0001) {
+                dash.normalize().multiply(1.1);
+                dash.setY(pogo == 1 ? 0.75 : 0.95);
+                player.setVelocity(dash);
+            }
+        }
         player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation(), 8, 0.3, 0.05, 0.3, 0.02);
     }
 
@@ -610,6 +626,37 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         if (pogoFlyers.remove(player.getUniqueId())) {
             player.setAllowFlight(false);
         }
+        // Secret glitch: quit on the death screen and you dodge the level loss (the bottle still dropped).
+        if (glitch("quit-escape") && player.isDead()) {
+            pendingLoss.remove(player.getUniqueId());
+        }
+    }
+
+    // Secret glitches that happen when you drop an item.
+    @EventHandler(ignoreCancelled = true)
+    public void onDropGlitch(PlayerDropItemEvent event) {
+        Player player = event.getPlayer();
+        ItemStack dropped = event.getItemDrop().getItemStack();
+
+        // Orbital reset: dropping the Orbital rod wipes its cooldown.
+        if (glitch("orbital-reset") && specialLevel(dropped, Special.ORBITAL) > 0) {
+            orbitalReady.remove(player.getUniqueId());
+        }
+
+        // Web dupe: drop a bottle or potion of levels while standing in a cobweb to get a copy.
+        if (!glitch("web-dupe") || levelsIn(dropped) == 0) return;
+        if (player.getLocation().getBlock().getType() != Material.COBWEB) return;
+        long now = System.currentTimeMillis();
+        if (dupeCooldown.getOrDefault(player.getUniqueId(), 0L) > now) return;
+        dupeCooldown.put(player.getUniqueId(), now + 30_000L);
+        ItemStack one = dropped.clone();
+        one.setAmount(1);
+        Item copy = player.getWorld().dropItem(event.getItemDrop().getLocation(), one);
+        copy.setVelocity(event.getItemDrop().getVelocity());
+        copy.setPickupDelay(20);
+        copy.setInvulnerable(true);
+        player.getWorld().spawnParticle(Particle.PORTAL, event.getItemDrop().getLocation(), 20, 0.3, 0.3, 0.3, 0.5);
+        tell(player, "Something glitched...", NamedTextColor.DARK_GRAY);
     }
 
     // Orbital: sneak + right-click with an Orbital fishing rod to call 6 TNT down from the sky.
@@ -828,6 +875,13 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         ItemStack rest = held.clone();
         rest.setAmount(held.getAmount() - 1);
         player.getInventory().setItem(hand, rest.getAmount() > 0 ? rest : null);
+        // Secret glitch: sneak-drink a Potion of Levels at max level - 1 to overflow past the cap.
+        if (glitch("overflow") && player.isSneaking() && gained >= 2 && player.getLevel() == maxLevel - 1) {
+            player.setExp(0f);
+            player.setLevel(maxLevel + 1);
+            tell(player, "Level overflow! (" + player.getLevel() + ")", NamedTextColor.LIGHT_PURPLE);
+            return;
+        }
         setLevel(player, player.getLevel() + gained);
         tell(player, "+" + gained + (gained == 1 ? " level (" : " levels (") + player.getLevel() + ")", NamedTextColor.GREEN);
     }
@@ -949,7 +1003,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage(Component.text("Usage: /" + label + " <check [player]|list|set <player> <level>|enchant <name> [1-2]|reload>", NamedTextColor.YELLOW));
+            sender.sendMessage(Component.text("Usage: /" + label + " <check [player]|list|set <player> <level>|enchant <name> [1-2]|glitches|reload>", NamedTextColor.YELLOW));
             return true;
         }
 
@@ -1028,6 +1082,18 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
                 }
                 sender.sendMessage(Component.text(target.getName() + " is now level " + target.getLevel() + ".", NamedTextColor.GREEN));
             }
+            case "glitches" -> {
+                if (!sender.hasPermission("enchantment.admin")) {
+                    sender.sendMessage(Component.text("You don't have permission.", NamedTextColor.RED));
+                    return true;
+                }
+                sender.sendMessage(Component.text("Secret glitches (turn off in config.yml under glitches:)", NamedTextColor.LIGHT_PURPLE));
+                sender.sendMessage(Component.text("web-dupe: drop a Bottle/Potion of Levels while standing in a cobweb (30s cooldown) to get a copy", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("overflow: sneak + drink a Potion of Levels at level " + (maxLevel - 1) + " to hit level " + (maxLevel + 1), NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("sprint-pogo: double jump while sprinting (Pogo boots) to dash forward", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("orbital-reset: dropping an Orbital rod resets its cooldown", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("quit-escape: quit on the death screen to dodge the level loss (bottle still drops)", NamedTextColor.GRAY));
+            }
             case "reload" -> {
                 if (!sender.hasPermission("enchantment.admin")) {
                     sender.sendMessage(Component.text("You don't have permission.", NamedTextColor.RED));
@@ -1043,7 +1109,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
-        if (args.length == 1) return List.of("check", "list", "set", "enchant", "reload");
+        if (args.length == 1) return List.of("check", "list", "set", "enchant", "glitches", "reload");
         if (args.length == 2 && (args[0].equalsIgnoreCase("check") || args[0].equalsIgnoreCase("set"))) {
             return getServer().getOnlinePlayers().stream().map(Player::getName).toList();
         }
