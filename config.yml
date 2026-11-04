@@ -68,3 +68,10 @@ block-pickup: false
 # Changing potion-recipe needs a full server restart.
 potion-recipe: true
 potion-levels: 2
+
+glitches:
+  drop-race: true
+  stale-cap: true
+  stacked-jump: true
+  portal-cooldown: true
+  early-quit: true
