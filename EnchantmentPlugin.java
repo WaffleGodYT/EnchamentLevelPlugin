@@ -41,6 +41,7 @@ import org.bukkit.event.entity.EntityShootBowEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.PrepareGrindstoneEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerExpChangeEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
@@ -79,7 +80,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
 
     private static final int ANVIL_RESULT_SLOT = 2;
 
-    // The 17 special enchants. They never go above level II.
+    // The 18 special enchants. They never go above level II.
     private enum Special {
         LIFESTEAL("Lifesteal", "Critical hits give you Regeneration (3s / 5s)", "_SWORD", "_AXE"),
         FROSTBITE("Frostbite", "Hits can chill and slow the target (25% / 40%)", "_SWORD", "_AXE"),
@@ -97,7 +98,8 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         ASCENSION("Ascension", "Hitting a player weakens and slows them, and gives you Fire Resistance and Speed (3s / 5s)", "MACE"),
         MUTILATION("Mutilation", "Much faster attacks (2x / 2.5x speed), but the sword wears out 4x faster", "_SWORD"),
         STORMCALLER("Stormcaller", "Trident hits can call lightning (15% / 25%, +3 / +5 damage)", "TRIDENT"),
-        GROUNDBREAKER("Groundbreaker", "Haste while holding a shovel (I / II)", "_SHOVEL");
+        GROUNDBREAKER("Groundbreaker", "Haste while holding a shovel (I / II)", "_SHOVEL"),
+        OVERDRIVE("Overdrive", "Sneak + right-click: Strength IV for 3s (40s / 25s cooldown)", "_SWORD", "_AXE");
 
         final String display;
         final String description;
@@ -131,7 +133,13 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
     private final Map<UUID, Long> secondWindReady = new HashMap<>();
     private final Map<UUID, Long> orbitalReady = new HashMap<>();
     private final Set<UUID> pogoFlyers = new HashSet<>();
-    private final Map<UUID, Long> dupeCooldown = new HashMap<>();
+    private final Map<UUID, Long> lastDropAt = new HashMap<>();
+    private final Map<UUID, Long> lastDrinkAt = new HashMap<>();
+    private final Map<UUID, Integer> lastDrinkFrom = new HashMap<>();
+    private final Map<UUID, Long> deathAt = new HashMap<>();
+    private final Map<UUID, Long> orbitalFired = new HashMap<>();
+    private final Map<UUID, Long> groundSeen = new HashMap<>();
+    private final Map<UUID, Long> overdriveReady = new HashMap<>();
     private NamespacedKey orbitalKey;
     private NamespacedKey mutilationKey;
     private boolean orbitalBreakBlocks;
@@ -200,7 +208,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         if (recipeKey != null) getServer().removeRecipe(recipeKey);
     }
 
-    // Secret glitches can each be switched off in config.yml under "glitches:" (default: on).
+    // Hidden glitches can each be switched off in config.yml under "glitches:" (default: on).
     private boolean glitch(String name) {
         return getConfig().getBoolean("glitches." + name, true);
     }
@@ -589,6 +597,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         int pogo = specialLevel(player.getInventory().getBoots(), Special.POGO);
         if (pogo > 0 && normal) {
             pogoFlyers.add(id);
+            if (player.isOnGround()) groundSeen.put(id, System.currentTimeMillis());
             if (player.isOnGround() && !player.getAllowFlight()) player.setAllowFlight(true);
         } else if (pogoFlyers.remove(id) && normal) {
             player.setFlying(false);
@@ -607,16 +616,14 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         event.setCancelled(true);
         player.setFlying(false);
         player.setAllowFlight(false);
-        player.setVelocity(player.getVelocity().setY(pogo == 1 ? 0.75 : 0.95));
-        // Secret glitch: double jump while sprinting and you dash forward.
-        if (glitch("sprint-pogo") && player.isSprinting()) {
-            var dash = player.getLocation().getDirection().setY(0);
-            if (dash.lengthSquared() > 0.0001) {
-                dash.normalize().multiply(1.1);
-                dash.setY(pogo == 1 ? 0.75 : 0.95);
-                player.setVelocity(dash);
-            }
+        double power = pogo == 1 ? 0.75 : 0.95;
+        // Glitch: a very fast double tap while sprinting lands before the ground check catches up,
+        // so the jump boost stacks.
+        if (glitch("stacked-jump") && player.isSprinting()
+                && System.currentTimeMillis() - groundSeen.getOrDefault(player.getUniqueId(), 0L) < 170L) {
+            power *= 1.6;
         }
+        player.setVelocity(player.getVelocity().setY(power));
         player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation(), 8, 0.3, 0.05, 0.3, 0.02);
     }
 
@@ -626,37 +633,66 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         if (pogoFlyers.remove(player.getUniqueId())) {
             player.setAllowFlight(false);
         }
-        // Secret glitch: quit on the death screen and you dodge the level loss (the bottle still dropped).
-        if (glitch("quit-escape") && player.isDead()) {
-            pendingLoss.remove(player.getUniqueId());
+        // Quitting while dead still costs the level. Glitch: quit within a second of dying
+        // and the loss never gets applied (the bottle still dropped).
+        if (player.isDead() && pendingLoss.remove(player.getUniqueId())) {
+            long diedAgo = System.currentTimeMillis() - deathAt.getOrDefault(player.getUniqueId(), 0L);
+            if (!(glitch("early-quit") && diedAgo < 1000L)) {
+                setLevel(player, player.getLevel() - 1);
+            }
         }
     }
 
-    // Secret glitches that happen when you drop an item.
+    // Remember when a bottle was dropped (used by the drink timing in onUseBottle).
     @EventHandler(ignoreCancelled = true)
-    public void onDropGlitch(PlayerDropItemEvent event) {
-        Player player = event.getPlayer();
-        ItemStack dropped = event.getItemDrop().getItemStack();
+    public void onDropTrack(PlayerDropItemEvent event) {
+        if (levelsIn(event.getItemDrop().getItemStack()) == 0) return;
+        lastDropAt.put(event.getPlayer().getUniqueId(), System.currentTimeMillis());
+    }
 
-        // Orbital reset: dropping the Orbital rod wipes its cooldown.
-        if (glitch("orbital-reset") && specialLevel(dropped, Special.ORBITAL) > 0) {
-            orbitalReady.remove(player.getUniqueId());
+    // Glitch: change world within 3 seconds of firing Orbital and the cooldown gets lost.
+    @EventHandler
+    public void onWorldHop(PlayerChangedWorldEvent event) {
+        if (!glitch("portal-cooldown")) return;
+        UUID id = event.getPlayer().getUniqueId();
+        if (System.currentTimeMillis() - orbitalFired.getOrDefault(id, 0L) < 3000L) {
+            orbitalReady.remove(id);
+        }
+    }
+
+    // Overdrive: sneak + right-click with an Overdrive weapon for Strength IV for 3 seconds.
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onOverdrive(PlayerInteractEvent event) {
+        if (!specialEnchants) return;
+        if (event.getAction() != Action.RIGHT_CLICK_AIR && event.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        if (event.getHand() != EquipmentSlot.HAND) return;
+        Player player = event.getPlayer();
+        if (!player.isSneaking()) return;
+        ItemStack weapon = event.getItem();
+        int overdrive = specialLevel(weapon, Special.OVERDRIVE);
+        if (overdrive == 0 || !canUse(player, weapon)) return;
+
+        long now = System.currentTimeMillis();
+        UUID id = player.getUniqueId();
+        long ready = overdriveReady.getOrDefault(id, 0L);
+        if (ready > now) {
+            tell(player, "Overdrive recharging: " + ((ready - now + 999) / 1000) + "s", NamedTextColor.RED);
+            return;
         }
 
-        // Web dupe: drop a bottle or potion of levels while standing in a cobweb to get a copy.
-        if (!glitch("web-dupe") || levelsIn(dropped) == 0) return;
-        if (player.getLocation().getBlock().getType() != Material.COBWEB) return;
-        long now = System.currentTimeMillis();
-        if (dupeCooldown.getOrDefault(player.getUniqueId(), 0L) > now) return;
-        dupeCooldown.put(player.getUniqueId(), now + 30_000L);
-        ItemStack one = dropped.clone();
-        one.setAmount(1);
-        Item copy = player.getWorld().dropItem(event.getItemDrop().getLocation(), one);
-        copy.setVelocity(event.getItemDrop().getVelocity());
-        copy.setPickupDelay(20);
-        copy.setInvulnerable(true);
-        player.getWorld().spawnParticle(Particle.PORTAL, event.getItemDrop().getLocation(), 20, 0.3, 0.3, 0.3, 0.5);
-        tell(player, "Something glitched...", NamedTextColor.DARK_GRAY);
+        player.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, 60, 3));
+        player.getWorld().spawnParticle(Particle.CRIT, player.getLocation().add(0, 1, 0), 20, 0.4, 0.6, 0.4, 0.1);
+        tell(player, "Overdrive!", NamedTextColor.LIGHT_PURPLE);
+
+        // The cooldown is saved 2 ticks later, and only if the weapon is still in your hand.
+        // Glitch: switch hotbar slots in that tiny gap and the cooldown never starts.
+        long cooldown = overdrive == 1 ? 40_000L : 25_000L;
+        getServer().getScheduler().runTaskLater(this, () -> {
+            boolean stillHolding = specialLevel(player.getInventory().getItemInMainHand(), Special.OVERDRIVE) > 0;
+            if (stillHolding || !glitch("swap-cooldown")) {
+                overdriveReady.put(id, System.currentTimeMillis() + cooldown);
+            }
+        }, 2L);
     }
 
     // Orbital: sneak + right-click with an Orbital fishing rod to call 6 TNT down from the sky.
@@ -679,6 +715,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
             return;
         }
         orbitalReady.put(player.getUniqueId(), now + (orbital == 1 ? 45_000L : 30_000L));
+        orbitalFired.put(player.getUniqueId(), now);
 
         RayTraceResult hit = player.rayTraceBlocks(40.0);
         Location aim = hit != null
@@ -831,6 +868,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
 
         if (victim.getLevel() > minLevel) {
             pendingLoss.add(victim.getUniqueId());
+            deathAt.put(victim.getUniqueId(), System.currentTimeMillis());
             Item bottle = victim.getWorld().dropItemNaturally(victim.getLocation(), levelBottle());
             bottle.setInvulnerable(true);
         }
@@ -867,22 +905,37 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
         event.setUseItemInHand(Event.Result.DENY);
         event.setUseInteractedBlock(Event.Result.DENY);
 
-        if (player.getLevel() >= maxLevel) {
+        long now = System.currentTimeMillis();
+        UUID id = player.getUniqueId();
+
+        // Glitch: drink twice within ~90ms and the max-level check reads the old level,
+        // so you can end up one level over the cap.
+        boolean stale = glitch("stale-cap") && now - lastDrinkAt.getOrDefault(id, 0L) < 90L;
+        int checkLevel = stale ? lastDrinkFrom.getOrDefault(id, player.getLevel()) : player.getLevel();
+        if (checkLevel >= maxLevel) {
             tell(player, "You're already at the max level (" + maxLevel + ")", NamedTextColor.YELLOW);
             return;
         }
 
-        ItemStack rest = held.clone();
-        rest.setAmount(held.getAmount() - 1);
-        player.getInventory().setItem(hand, rest.getAmount() > 0 ? rest : null);
-        // Secret glitch: sneak-drink a Potion of Levels at max level - 1 to overflow past the cap.
-        if (glitch("overflow") && player.isSneaking() && gained >= 2 && player.getLevel() == maxLevel - 1) {
-            player.setExp(0f);
-            player.setLevel(maxLevel + 1);
-            tell(player, "Level overflow! (" + player.getLevel() + ")", NamedTextColor.LIGHT_PURPLE);
-            return;
+        // Glitch: drink right after dropping one from the same stack and (sometimes) the
+        // bottle isn't used up.
+        boolean raced = glitch("drop-race") && now - lastDropAt.getOrDefault(id, 0L) < 120L
+                && ThreadLocalRandom.current().nextDouble() < 0.4;
+        if (!raced) {
+            ItemStack rest = held.clone();
+            rest.setAmount(held.getAmount() - 1);
+            player.getInventory().setItem(hand, rest.getAmount() > 0 ? rest : null);
         }
-        setLevel(player, player.getLevel() + gained);
+
+        int before = player.getLevel();
+        lastDrinkAt.put(id, now);
+        lastDrinkFrom.put(id, before);
+        if (stale) {
+            player.setExp(0f);
+            player.setLevel(Math.min(maxLevel + 1, before + gained));
+        } else {
+            setLevel(player, before + gained);
+        }
         tell(player, "+" + gained + (gained == 1 ? " level (" : " levels (") + player.getLevel() + ")", NamedTextColor.GREEN);
     }
 
@@ -1003,7 +1056,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
         if (args.length == 0) {
-            sender.sendMessage(Component.text("Usage: /" + label + " <check [player]|list|set <player> <level>|enchant <name> [1-2]|glitches|reload>", NamedTextColor.YELLOW));
+            sender.sendMessage(Component.text("Usage: /" + label + " <check [player]|list|set <player> <level>|enchant <name> [1-2]|reload>", NamedTextColor.YELLOW));
             return true;
         }
 
@@ -1087,12 +1140,13 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
                     sender.sendMessage(Component.text("You don't have permission.", NamedTextColor.RED));
                     return true;
                 }
-                sender.sendMessage(Component.text("Secret glitches (turn off in config.yml under glitches:)", NamedTextColor.LIGHT_PURPLE));
-                sender.sendMessage(Component.text("web-dupe: drop a Bottle/Potion of Levels while standing in a cobweb (30s cooldown) to get a copy", NamedTextColor.GRAY));
-                sender.sendMessage(Component.text("overflow: sneak + drink a Potion of Levels at level " + (maxLevel - 1) + " to hit level " + (maxLevel + 1), NamedTextColor.GRAY));
-                sender.sendMessage(Component.text("sprint-pogo: double jump while sprinting (Pogo boots) to dash forward", NamedTextColor.GRAY));
-                sender.sendMessage(Component.text("orbital-reset: dropping an Orbital rod resets its cooldown", NamedTextColor.GRAY));
-                sender.sendMessage(Component.text("quit-escape: quit on the death screen to dodge the level loss (bottle still drops)", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("Hidden glitches (turn off in config.yml under glitches:)", NamedTextColor.LIGHT_PURPLE));
+                sender.sendMessage(Component.text("drop-race: drop one bottle (Q) from a stack and right-click within ~0.1s: 40% chance the bottle isn't used up", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("stale-cap: right-click a stack of bottles at " + (maxLevel - 1) + " faster than ~11 clicks/sec to reach " + (maxLevel + 1), NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("stacked-jump: sprint + extremely fast double tap jump with Pogo boots = a much higher jump", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("portal-cooldown: change world within 3s of firing Orbital and its cooldown is lost", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("early-quit: quit within 1s of dying and you keep the level (bottle still drops)", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("swap-cooldown: right-click with an Overdrive weapon, then switch hotbar slots within ~0.1s: the cooldown never starts (repeat = infinite Strength IV)", NamedTextColor.GRAY));
             }
             case "reload" -> {
                 if (!sender.hasPermission("enchantment.admin")) {
@@ -1109,7 +1163,7 @@ public final class EnchantmentPlugin extends JavaPlugin implements Listener, Tab
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
-        if (args.length == 1) return List.of("check", "list", "set", "enchant", "glitches", "reload");
+        if (args.length == 1) return List.of("check", "list", "set", "enchant", "reload");
         if (args.length == 2 && (args[0].equalsIgnoreCase("check") || args[0].equalsIgnoreCase("set"))) {
             return getServer().getOnlinePlayers().stream().map(Player::getName).toList();
         }
